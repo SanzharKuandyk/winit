@@ -419,6 +419,21 @@ impl winit_web::EventLoopExtWeb for EventLoop {
 #[cfg(windows_platform)]
 impl winit_win32::EventLoopBuilderExtWindows for EventLoopBuilder {
     #[inline]
+    fn with_raw_input_mode(&mut self, raw_input_mode: winit_win32::RawInputMode) -> &mut Self {
+        self.platform_specific.raw_input_mode = raw_input_mode;
+        self
+    }
+
+    #[inline]
+    fn with_raw_input_dispatch_policy(
+        &mut self,
+        policy: winit_win32::RawInputDispatchPolicy,
+    ) -> &mut Self {
+        self.platform_specific.raw_input_dispatch_policy = policy;
+        self
+    }
+
+    #[inline]
     fn with_any_thread(&mut self, any_thread: bool) -> &mut Self {
         self.platform_specific.any_thread = any_thread;
         self

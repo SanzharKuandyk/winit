@@ -56,10 +56,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCCREATE,
     WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SIZING,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT,
-    WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_TOUCH, WM_WINDOWPOSCHANGED,
+    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT,
+    WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED,
+    WS_POPUP, WS_VISIBLE,
 };
 use windows_sys::core::BOOL;
 use winit_core::application::ApplicationHandler;
@@ -96,10 +97,11 @@ use crate::ime::ImeContext;
 use crate::keyboard::KeyEventBuilder;
 use crate::keyboard_layout::LAYOUT_CACHE;
 use crate::monitor::{self, MonitorHandle};
+use crate::raw_input::RawInputBuffer;
 use crate::util::{WIN10_BUILD_VERSION, wrap_device_id};
 use crate::window::{self, InitData, Window};
 use crate::window_state::{CursorFlags, ImeState, WindowFlags, WindowState};
-use crate::{raw_input, util};
+use crate::{RawInputDispatchPolicy, RawInputMode, raw_input, util};
 
 // This is defined in `winuser.h` as a macro that expands to `UINT_MAX`
 const WHEEL_PAGESCROLL: u32 = u32::MAX;
@@ -107,6 +109,11 @@ const WHEEL_PAGESCROLL: u32 = u32::MAX;
 const DEFAULT_SCROLL_LINES_PER_WHEEL_DELTA: isize = 3;
 // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-systemparametersinfoa#:~:text=SPI_GETWHEELSCROLLCHARS
 const DEFAULT_SCROLL_CHARACTERS_PER_WHEEL_DELTA: isize = 3;
+
+// Buffered dispatch yields at these limits. YieldBetweenBatches finishes the fetched batch first.
+// Callback duration is outside the event loop's control, so the time budget is not a hard deadline.
+const MAX_BUFFERED_DISPATCH_ITEMS: usize = 64;
+const BUFFERED_DISPATCH_BUDGET: Duration = Duration::from_millis(2);
 
 pub(crate) struct WindowData {
     pub window_state: Arc<Mutex<WindowState>>,
@@ -152,6 +159,10 @@ pub(crate) enum ProcResult {
 
 pub struct EventLoop {
     runner: Rc<EventLoopRunner>,
+    raw_input_mode: RawInputMode,
+    raw_input_dispatch_policy: RawInputDispatchPolicy,
+    // Keep fetched records until they have all been delivered, even when dispatch pauses.
+    raw_input_buffer: Option<RawInputBuffer>,
     msg_hook: Option<Box<dyn FnMut(*const c_void) -> bool + 'static>>,
     // It is a timer used on timed waits.
     // It is created lazily in case if we have `ControlFlow::WaitUntil`.
@@ -161,11 +172,16 @@ pub struct EventLoop {
 
 impl fmt::Debug for EventLoop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EventLoop").finish_non_exhaustive()
+        f.debug_struct("EventLoop")
+            .field("raw_input_mode", &self.raw_input_mode)
+            .field("raw_input_dispatch_policy", &self.raw_input_dispatch_policy)
+            .finish_non_exhaustive()
     }
 }
 
 pub struct PlatformSpecificEventLoopAttributes {
+    pub raw_input_mode: RawInputMode,
+    pub raw_input_dispatch_policy: RawInputDispatchPolicy,
     pub any_thread: bool,
     pub dpi_aware: bool,
     pub msg_hook: Option<Box<dyn FnMut(*const c_void) -> bool + 'static>>,
@@ -174,6 +190,8 @@ pub struct PlatformSpecificEventLoopAttributes {
 impl fmt::Debug for PlatformSpecificEventLoopAttributes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlatformSpecificEventLoopAttributes")
+            .field("raw_input_mode", &self.raw_input_mode)
+            .field("raw_input_dispatch_policy", &self.raw_input_dispatch_policy)
             .field("any_thread", &self.any_thread)
             .field("dpi_aware", &self.dpi_aware)
             .finish_non_exhaustive()
@@ -182,13 +200,21 @@ impl fmt::Debug for PlatformSpecificEventLoopAttributes {
 
 impl Default for PlatformSpecificEventLoopAttributes {
     fn default() -> Self {
-        Self { any_thread: false, dpi_aware: true, msg_hook: None }
+        Self {
+            raw_input_mode: RawInputMode::Immediate,
+            raw_input_dispatch_policy: RawInputDispatchPolicy::default(),
+            any_thread: false,
+            dpi_aware: true,
+            msg_hook: None,
+        }
     }
 }
 
 impl PartialEq for PlatformSpecificEventLoopAttributes {
     fn eq(&self, other: &Self) -> bool {
-        self.any_thread.eq(&other.any_thread)
+        self.raw_input_mode.eq(&other.raw_input_mode)
+            && self.raw_input_dispatch_policy.eq(&other.raw_input_dispatch_policy)
+            && self.any_thread.eq(&other.any_thread)
             && self.dpi_aware.eq(&other.dpi_aware)
             && match (&self.msg_hook, &other.msg_hook) {
                 (Some(this), Some(other)) => std::ptr::eq(&this, &other),
@@ -202,6 +228,8 @@ impl Eq for PlatformSpecificEventLoopAttributes {}
 
 impl std::hash::Hash for PlatformSpecificEventLoopAttributes {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw_input_mode.hash(state);
+        self.raw_input_dispatch_policy.hash(state);
         self.any_thread.hash(state);
         self.dpi_aware.hash(state);
         std::ptr::hash(&self.msg_hook, state);
@@ -243,8 +271,21 @@ impl EventLoop {
             Default::default(),
         );
 
+        // A message hook must see every WM_INPUT. Unsupported architectures also use the
+        // ordinary message path, as RawInputBuffer::new returns None on those targets.
+        let raw_input_buffer = if attributes.raw_input_mode == RawInputMode::Buffered
+            && attributes.msg_hook.is_none()
+        {
+            RawInputBuffer::new()
+        } else {
+            None
+        };
+
         Ok(EventLoop {
             runner: runner_shared,
+            raw_input_mode: attributes.raw_input_mode,
+            raw_input_dispatch_policy: attributes.raw_input_dispatch_policy,
+            raw_input_buffer,
             msg_hook: attributes.msg_hook.take(),
             high_resolution_timer: None,
         })
@@ -328,11 +369,18 @@ impl EventLoop {
         // events, and NewEvents after the RunLoop wakes up.
         //
         // We emulate similar behaviour by treating `MsgWaitForMultipleObjectsEx` as our wait
-        // point and wake up point (when it returns) and we drain all other
-        // pending messages via `PeekMessage` until we come back to "wait" via
-        // `MsgWaitForMultipleObjectsEx`.
+        // point and wake up point (when it returns). Between waits we dispatch
+        // pending messages, with buffered mode also allowing a bounded dispatch
+        // pass and retaining unread raw-input records for the next pass.
         //
         self.runner.prepare_wait();
+        // GetRawInputBuffer has already removed these records' WM_INPUT messages. Windows
+        // cannot wake us for them, so do not sleep while a partially delivered batch remains.
+        let timeout = if self.raw_input_buffer.as_ref().is_some_and(|buffer| !buffer.is_empty()) {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        };
         wait_for_messages_impl(
             &mut self.high_resolution_timer,
             self.runner.control_flow(),
@@ -342,7 +390,7 @@ impl EventLoop {
         self.runner.wakeup();
     }
 
-    /// Dispatch all queued messages via `PeekMessageW`
+    /// Dispatch queued messages, yielding after a bounded pass in buffered mode.
     fn dispatch_peeked_messages(&mut self) {
         // We generally want to continue dispatching all pending messages
         // but we also allow dispatching to be interrupted as a means to
@@ -357,35 +405,141 @@ impl EventLoop {
         // API) and there's no API to construct or initialize a `MSG`. This
         // is the simplest way avoid uninitialized memory in Rust
         let mut msg: MSG = unsafe { mem::zeroed() };
+        let bounded_dispatch = self.raw_input_buffer.is_some();
+        let dispatch_started = bounded_dispatch.then(Instant::now);
+        let mut dispatched = 0;
 
         loop {
-            unsafe {
-                if PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) == false.into() {
+            if self.should_interrupt_dispatch() {
+                break;
+            }
+
+            if self.raw_input_buffer.as_ref().is_some_and(|buffer| !buffer.is_empty()) {
+                if let Some(data) = self.next_buffered_raw_input() {
+                    let userdata =
+                        ThreadMsgTargetData { event_loop_runner: Rc::clone(&self.runner) };
+                    unsafe { handle_raw_input(&userdata, data) };
+                }
+            } else {
+                // Keep the normal Windows ordering and allow WM_INPUT_DEVICE_CHANGE through.
+                // The WM_INPUT removed here must be read by the ordinary window procedure
+                // with GetRawInputData before we read any additional records in bulk.
+                let message_available = unsafe {
+                    PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != false.into()
+                };
+                if !message_available {
+                    // PeekMessage can itself enter a window procedure for nonqueued messages.
+                    self.should_interrupt_dispatch();
                     break;
                 }
 
-                let handled = if let Some(callback) = self.msg_hook.as_deref_mut() {
-                    callback(&mut msg as *mut _ as *mut _)
-                } else {
-                    false
-                };
-                if !handled {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                let delivered = self.dispatch_message_with_hook(&mut msg);
+                if self.should_interrupt_dispatch() {
+                    break;
+                }
+
+                if delivered
+                    && msg.message == WM_INPUT
+                    && msg.hwnd == self.runner.thread_msg_target
+                {
+                    if let Some(buffer) = self.raw_input_buffer.as_mut() {
+                        // Exactly one finite batch, not a drain-until-empty loop. Finish its
+                        // records before retrieving another WM_INPUT, preserving raw order.
+                        if let Err(error) = buffer.read() {
+                            tracing::warn!("Disabling buffered raw input after read failure: {error}");
+                            self.raw_input_buffer = None;
+                        }
+                    }
                 }
             }
 
-            if let Err(payload) = self.runner.take_panic_error() {
-                self.runner.reset_runner();
-                panic::resume_unwind(payload);
-            }
-
-            if let Some(_code) = self.runner.exit_code() {
+            // This checkpoint also runs after every buffered record, even if no MSG follows.
+            if self.should_interrupt_dispatch() {
                 break;
             }
 
-            if self.runner.interrupt_msg_dispatch.get() {
-                break;
+            if bounded_dispatch {
+                dispatched += 1;
+                let budget_exhausted = dispatched >= MAX_BUFFERED_DISPATCH_ITEMS
+                    || dispatch_started
+                        .is_some_and(|start| start.elapsed() >= BUFFERED_DISPATCH_BUDGET);
+                let should_yield = match self.raw_input_dispatch_policy {
+                    RawInputDispatchPolicy::YieldBetweenRecords => budget_exhausted,
+                    RawInputDispatchPolicy::YieldBetweenBatches => {
+                        // Once the budget is exhausted, finish the fetched batch before yielding.
+                        // New arrivals stay queued; they cannot extend the current batch.
+                        let batch_pending = self
+                            .raw_input_buffer
+                            .as_ref()
+                            .is_some_and(|buffer| !buffer.is_empty());
+                        budget_exhausted && !batch_pending
+                    },
+                };
+                if should_yield {
+                    self.dispatch_low_priority_messages();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Honor the message hook on every path, including the fairness pass below.
+    fn dispatch_message_with_hook(&mut self, msg: &mut MSG) -> bool {
+        if let Some(callback) = self.msg_hook.as_deref_mut() {
+            if callback(msg as *mut _ as *mut _) {
+                return false;
+            }
+        }
+        unsafe {
+            TranslateMessage(msg);
+            DispatchMessageW(msg);
+        }
+        true
+    }
+
+    fn should_interrupt_dispatch(&self) -> bool {
+        if let Err(payload) = self.runner.take_panic_error() {
+            self.runner.reset_runner();
+            panic::resume_unwind(payload);
+        }
+        self.runner.exit_code().is_some() || self.runner.interrupt_msg_dispatch.get()
+    }
+
+    fn next_buffered_raw_input(&mut self) -> Option<RAWINPUT> {
+        match self.raw_input_buffer.as_mut()?.next_record() {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!("Disabling buffered raw input after invalid record: {error}");
+                self.raw_input_buffer = None;
+                None
+            },
+        }
+    }
+
+    fn dispatch_low_priority_messages(&mut self) {
+        // Input/posted messages normally precede timers and paint. Give low-priority work a
+        // bounded turn *after* ordinary processing, never ahead of it on every iteration.
+        // An internal-target paint may precede an application paint, so allow more than one;
+        // a delivered RedrawRequested still interrupts immediately via the runner.
+        for (message, limit) in [(WM_TIMER, 1), (WM_PAINT, 32)] {
+            for _ in 0..limit {
+                if self.should_interrupt_dispatch() {
+                    return;
+                }
+                let mut msg: MSG = unsafe { mem::zeroed() };
+                let available = unsafe {
+                    PeekMessageW(&mut msg, ptr::null_mut(), message, message, PM_REMOVE)
+                        != false.into()
+                };
+                if available {
+                    self.dispatch_message_with_hook(&mut msg);
+                }
+                if self.should_interrupt_dispatch() {
+                    return;
+                }
+                if !available {
+                    break;
+                }
             }
         }
     }

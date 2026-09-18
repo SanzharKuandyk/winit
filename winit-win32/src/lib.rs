@@ -48,6 +48,56 @@ pub type HMENU = *mut c_void;
 /// Monitor Handle type used by Win32 API
 pub type HMONITOR = *mut c_void;
 
+/// Configures how the Windows backend processes raw input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum RawInputMode {
+    /// Dispatch every WM_INPUT separately.
+    #[default]
+    Immediate,
+
+    /// Read additional queued raw-input records in bounded batches after dispatching a
+    /// `WM_INPUT` normally. Each record still produces its individual device events; motion
+    /// is not coalesced and reads are not synchronized to frames.
+    ///
+    /// Between batches, ordinary messages are processed normally. Dispatch periodically
+    /// yields to timers and redraws, retaining any unread records for the next iteration.
+    /// See [`RawInputDispatchPolicy`] for when a dispatch pass yields.
+    ///
+    /// Falls back to [`Self::Immediate`] on 32-bit builds (including WOW64), when a message
+    /// hook is installed, or after a buffered-read/decoding error. Hooks must be able to
+    /// observe every `WM_INPUT`, which is incompatible with consuming those messages in bulk.
+    /// Messages dispatched by nested Windows modal loops may also use the immediate path.
+    Buffered,
+}
+
+/// Controls when buffered raw-input dispatch yields to other event-loop work.
+///
+/// Only applies while [`RawInputMode::Buffered`] is active. Both policies deliver individual
+/// device events without coalescing or waiting for a batch to fill. Exit requests, panics,
+/// and redraw interruptions caused by callbacks are honored under either policy.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum RawInputDispatchPolicy {
+    /// Check the dispatch budget after each record, retaining unread records for the next pass.
+    ///
+    /// The current limits are 64 dispatch items or two milliseconds, checked between callbacks.
+    /// An individual callback can exceed the time limit. These limits may change.
+    #[default]
+    YieldBetweenRecords,
+
+    /// When the dispatch budget is exhausted, finish the current fetched batch before yielding
+    /// to timers and redraws, then end the dispatch pass.
+    ///
+    /// Multiple batches may be processed while budget remains. After exhaustion is detected,
+    /// no further batch is fetched in that pass. The batch has a fixed storage capacity, but
+    /// slow callbacks can make its delivery exceed the dispatch budget.
+    /// Callbacks and nested Windows modal loops can still cause redraws before the batch finishes.
+    YieldBetweenBatches,
+}
+
 /// Describes a system-drawn backdrop material of a window.
 ///
 /// For a detailed explanation, see [`DWM_SYSTEMBACKDROP_TYPE docs`].
@@ -169,6 +219,33 @@ impl<W: CoreWindow> rwh_06::HasWindowHandle for AnyThread<W> {
 
 /// Additional methods on `EventLoop` that are specific to Windows.
 pub trait EventLoopBuilderExtWindows {
+    /// Configures how raw input is processed by the event loop.
+    ///
+    /// See [`RawInputMode::Buffered`] for batching semantics and fallback conditions.
+    fn with_raw_input_mode(&mut self, raw_input_mode: RawInputMode) -> &mut Self;
+
+    /// Configures when buffered raw-input dispatch yields to other event-loop work.
+    ///
+    /// Defaults to [`RawInputDispatchPolicy::YieldBetweenRecords`]. This has no effect in
+    /// [`RawInputMode::Immediate`] or when buffered processing falls back to immediate processing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use winit::event_loop::EventLoop;
+    /// #[cfg(target_os = "windows")]
+    /// use winit::platform::windows::{
+    ///     EventLoopBuilderExtWindows, RawInputDispatchPolicy, RawInputMode,
+    /// };
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "windows")]
+    /// builder
+    ///     .with_raw_input_mode(RawInputMode::Buffered)
+    ///     .with_raw_input_dispatch_policy(RawInputDispatchPolicy::YieldBetweenBatches);
+    /// ```
+    fn with_raw_input_dispatch_policy(&mut self, policy: RawInputDispatchPolicy) -> &mut Self;
+
     /// Whether to allow the event loop to be created off of the main thread.
     ///
     /// By default, the window is only allowed to be created on the main
@@ -206,6 +283,9 @@ pub trait EventLoopBuilderExtWindows {
 
     /// A callback to be executed before dispatching a win32 message to the window procedure.
     /// Return true to disable winit's internal message dispatching.
+    ///
+    /// Installing a hook disables raw-input batching, even if [`RawInputMode::Buffered`] was
+    /// selected, so the hook can observe and intercept every retrieved `WM_INPUT` message.
     ///
     /// # Example
     ///
