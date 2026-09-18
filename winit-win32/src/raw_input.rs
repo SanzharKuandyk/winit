@@ -1,3 +1,5 @@
+mod buffered;
+
 use std::mem::{self, size_of};
 use std::ptr;
 
@@ -24,6 +26,7 @@ use winit_core::event::ElementState;
 use winit_core::event_loop::DeviceEvents;
 use winit_core::keyboard::{KeyCode, PhysicalKey};
 
+pub(crate) use self::buffered::RawInputBuffer;
 use super::scancode_to_physicalkey;
 use crate::util;
 
