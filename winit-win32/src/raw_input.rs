@@ -9,8 +9,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_NUMLOCK, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Input::{
-    GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
-    RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO,
+    GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT,
+    RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO,
     RID_DEVICE_INFO_HID, RID_DEVICE_INFO_KEYBOARD, RID_DEVICE_INFO_MOUSE, RID_INPUT,
     RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIM_TYPEHID,
     RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
@@ -178,6 +178,19 @@ pub fn get_raw_input_data(handle: HRAWINPUT) -> Option<RAWINPUT> {
     }
 
     Some(data)
+}
+
+/// Reads as many queued mouse and keyboard raw-input packets as fit in `buffer`.
+///
+/// The Windows backend only registers fixed-size mouse and keyboard packets, so the returned
+/// entries can be addressed as a regular `RAWINPUT` slice. HID packets would instead require
+/// walking the buffer using each packet's `RAWINPUTHEADER::dwSize`.
+pub fn get_raw_input_buffer(buffer: &mut [RAWINPUT]) -> Option<usize> {
+    let mut data_size = mem::size_of_val(buffer) as u32;
+    let header_size = size_of::<RAWINPUTHEADER>() as u32;
+
+    let count = unsafe { GetRawInputBuffer(buffer.as_mut_ptr(), &mut data_size, header_size) };
+    if count == u32::MAX { None } else { Some(count as usize) }
 }
 
 fn button_flags_to_element_state(

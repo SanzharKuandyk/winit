@@ -98,6 +98,7 @@ use crate::util::{WIN10_BUILD_VERSION, wrap_device_id};
 use crate::window::{self, InitData, Window};
 use crate::window_state::{CursorFlags, ImeState, WindowFlags, WindowState};
 use crate::{raw_input, util};
+use crate::RawInputMode;
 
 // This is defined in `winuser.h` as a macro that expands to `UINT_MAX`
 const WHEEL_PAGESCROLL: u32 = u32::MAX;
@@ -150,6 +151,7 @@ pub(crate) enum ProcResult {
 
 pub struct EventLoop {
     runner: Rc<EventLoopRunner>,
+    raw_input_mode: RawInputMode,
     msg_hook: Option<Box<dyn FnMut(*const c_void) -> bool + 'static>>,
     // It is a timer used on timed waits.
     // It is created lazily in case if we have `ControlFlow::WaitUntil`.
@@ -159,11 +161,14 @@ pub struct EventLoop {
 
 impl fmt::Debug for EventLoop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EventLoop").finish_non_exhaustive()
+        f.debug_struct("EventLoop")
+            .field("raw_input_mode", &self.raw_input_mode)
+            .finish_non_exhaustive()
     }
 }
 
 pub struct PlatformSpecificEventLoopAttributes {
+    pub raw_input_mode: RawInputMode,
     pub any_thread: bool,
     pub dpi_aware: bool,
     pub msg_hook: Option<Box<dyn FnMut(*const c_void) -> bool + 'static>>,
@@ -172,6 +177,7 @@ pub struct PlatformSpecificEventLoopAttributes {
 impl fmt::Debug for PlatformSpecificEventLoopAttributes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlatformSpecificEventLoopAttributes")
+            .field("raw_input_mode", &self.raw_input_mode)
             .field("any_thread", &self.any_thread)
             .field("dpi_aware", &self.dpi_aware)
             .finish_non_exhaustive()
@@ -180,13 +186,19 @@ impl fmt::Debug for PlatformSpecificEventLoopAttributes {
 
 impl Default for PlatformSpecificEventLoopAttributes {
     fn default() -> Self {
-        Self { any_thread: false, dpi_aware: true, msg_hook: None }
+        Self {
+            raw_input_mode: RawInputMode::Immediate,
+            any_thread: false,
+            dpi_aware: true,
+            msg_hook: None,
+        }
     }
 }
 
 impl PartialEq for PlatformSpecificEventLoopAttributes {
     fn eq(&self, other: &Self) -> bool {
-        self.any_thread.eq(&other.any_thread)
+        self.raw_input_mode.eq(&other.raw_input_mode)
+            && self.any_thread.eq(&other.any_thread)
             && self.dpi_aware.eq(&other.dpi_aware)
             && match (&self.msg_hook, &other.msg_hook) {
                 (Some(this), Some(other)) => std::ptr::eq(&this, &other),
@@ -200,6 +212,7 @@ impl Eq for PlatformSpecificEventLoopAttributes {}
 
 impl std::hash::Hash for PlatformSpecificEventLoopAttributes {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw_input_mode.hash(state);
         self.any_thread.hash(state);
         self.dpi_aware.hash(state);
         std::ptr::hash(&self.msg_hook, state);
@@ -243,6 +256,7 @@ impl EventLoop {
 
         Ok(EventLoop {
             runner: runner_shared,
+            raw_input_mode: attributes.raw_input_mode,
             msg_hook: attributes.msg_hook.take(),
             high_resolution_timer: None,
         })
@@ -355,10 +369,50 @@ impl EventLoop {
         // API) and there's no API to construct or initialize a `MSG`. This
         // is the simplest way avoid uninitialized memory in Rust
         let mut msg: MSG = unsafe { mem::zeroed() };
+        let mut raw_input_buffer = [RAWINPUT::default(); 64];
+        let mut buffered_raw_input = self.raw_input_mode == RawInputMode::Buffered;
 
         loop {
+            if buffered_raw_input {
+                let userdata =
+                    ThreadMsgTargetData { event_loop_runner: Rc::clone(&self.runner) };
+
+                loop {
+                    let Some(count) = raw_input::get_raw_input_buffer(&mut raw_input_buffer) else {
+                        // Fall back to dispatching individual WM_INPUT messages for the rest of
+                        // this cycle. If raw input stayed queued, QS_RAWINPUT would remain set and
+                        // the event loop could spin instead of waiting.
+                        buffered_raw_input = false;
+                        break;
+                    };
+                    if count == 0 {
+                        break;
+                    }
+
+                    for data in &raw_input_buffer[..count] {
+                        unsafe { handle_raw_input(&userdata, *data) };
+                    }
+                }
+            }
+
             unsafe {
-                if PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) == false.into() {
+                let message_available = if buffered_raw_input {
+                    // Keep WM_INPUT queued for GetRawInputBuffer.
+                    // Every other window message still use the normal dispatch path.
+                    PeekMessageW(&mut msg, ptr::null_mut(), 0, WM_INPUT - 1, PM_REMOVE)
+                        != false.into()
+                        || PeekMessageW(
+                            &mut msg,
+                            ptr::null_mut(),
+                            WM_INPUT + 1,
+                            0xffff,
+                            PM_REMOVE,
+                        ) != false.into()
+                } else {
+                    PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != false.into()
+                };
+
+                if !message_available {
                     break;
                 }
 

@@ -48,6 +48,19 @@ pub type HMENU = *mut c_void;
 /// Monitor Handle type used by Win32 API
 pub type HMONITOR = *mut c_void;
 
+/// Configures how the Windows backend processes raw input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum RawInputMode {
+    /// Existing behavior: dispatch every WM_INPUT separately.
+    #[default]
+    Immediate,
+
+    /// Read queued RAWINPUT packets in batches, but emit every DeviceEvent.
+    Buffered,
+}
+
 /// Describes a system-drawn backdrop material of a window.
 ///
 /// For a detailed explanation, see [`DWM_SYSTEMBACKDROP_TYPE docs`].
@@ -169,6 +182,9 @@ impl<W: CoreWindow> rwh_06::HasWindowHandle for AnyThread<W> {
 
 /// Additional methods on `EventLoop` that are specific to Windows.
 pub trait EventLoopBuilderExtWindows {
+    /// Configures how raw input is processed by the event loop.
+    fn with_raw_input_mode(&mut self, raw_input_mode: RawInputMode) -> &mut Self;
+
     /// Whether to allow the event loop to be created off of the main thread.
     ///
     /// By default, the window is only allowed to be created on the main
